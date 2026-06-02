@@ -1,0 +1,270 @@
+name: ARM64 JVM Profiling Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_minutes:
+        description: "Total time to keep JVM running. Use 120 for 2 hours. Max: 120."
+        required: true
+        default: "10"
+      tracker_interval_seconds:
+        description: "CSV sampling interval in seconds."
+        required: true
+        default: "30"
+
+jobs:
+  profile-on-arm64:
+    name: Run JVM profiling on ARM64 Linux
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 125
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Confirm this is an ARM64 machine
+        run: |
+          set -euxo pipefail
+
+          echo "Kernel:"
+          uname -a
+
+          echo "Machine architecture:"
+          uname -m
+
+          echo "CPU info:"
+          lscpu | head -40
+
+          ARCH="$(uname -m)"
+          if [ "$ARCH" != "aarch64" ] && [ "$ARCH" != "arm64" ]; then
+            echo "ERROR: Expected ARM64/aarch64, got: $ARCH"
+            exit 1
+          fi
+
+      - name: Set up Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Verify Java tools
+        run: |
+          set -euxo pipefail
+          java -version
+          javac -version
+          which jcmd
+          which jstat
+
+      - name: Create dummy Java profiling app
+        run: |
+          set -euxo pipefail
+
+          cat << 'EOF' > ProfilePoc.java
+          import java.util.*;
+
+          public class ProfilePoc {
+              public static void main(String[] args) throws Exception {
+                  System.out.println("=== PoC Application Running ===");
+
+                  List<UUID> memoryHog = new ArrayList<>();
+
+                  while (true) {
+                      for (int i = 0; i < 5000; i++) {
+                          UUID id = UUID.randomUUID();
+
+                          String dummy = id.toString()
+                                           .toUpperCase()
+                                           .replace("-", "_");
+
+                          if (dummy.contains("A")) {
+                              memoryHog.add(id);
+                          }
+                      }
+
+                      if (memoryHog.size() > 50_000) {
+                          memoryHog.clear();
+                      }
+
+                      Thread.sleep(10);
+                  }
+              }
+          }
+          EOF
+
+          javac ProfilePoc.java
+
+      - name: Create JVM time-series tracker
+        run: |
+          set -euxo pipefail
+
+          cat << 'EOF' > jvm_advanced_tracker.sh
+          #!/bin/bash
+
+          PID=$1
+          INTERVAL=${2:-30}
+
+          if [ -z "$PID" ]; then
+              echo "Usage: ./jvm_advanced_tracker.sh <PID> [INTERVAL_IN_SECONDS]"
+              exit 1
+          fi
+
+          OUTPUT_FILE="jvm_advanced_timeseries.csv"
+
+          echo "Timestamp,Process_Name,PID,CPU_Pct,Process_Mem_MB,Thread_Count,Thread_Runnable_Count,Thread_Blocked_Count,Thread_Waiting_Count,Thread_Timed_Waiting_Count,Eden_Util_Pct,Old_Gen_Util_Pct,Metaspace_Util_Pct,Young_GC_Count,Full_GC_Count,Total_GC_Time_Secs" > $OUTPUT_FILE
+
+          echo "=========================================================="
+          echo " Advanced Metric Logging Active for JVM PID: $PID"
+          echo " Streaming time-series logs directly to: $OUTPUT_FILE"
+          echo "=========================================================="
+
+          while true; do
+
+              if ! kill -0 $PID 2>/dev/null; then
+                  echo "Target JVM Process $PID has terminated."
+                  break
+              fi
+
+              TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S")
+
+              OS_STATS=$(ps -p $PID -o %cpu=,rss=,nlwp= | xargs)
+
+              CPU=$(echo $OS_STATS | awk '{print $1}')
+              RSS_KB=$(echo $OS_STATS | awk '{print $2}')
+              THREADS=$(echo $OS_STATS | awk '{print $3}')
+              PROCESS_NAME=$(ps -p $PID -o args= | tr -d '\n' | tr -d ',' | head -c 100)
+
+              MEM_MB=$(awk "BEGIN {print $RSS_KB/1024}")
+
+              JSTAT_ROW=$(jstat -gcutil $PID 1 1 | tail -n 1)
+
+              EDEN_PCT=$(echo $JSTAT_ROW | awk '{print $3}')
+              OLD_PCT=$(echo $JSTAT_ROW | awk '{print $4}')
+              META_PCT=$(echo $JSTAT_ROW | awk '{print $5}')
+
+              YGC_COUNT=$(echo $JSTAT_ROW | awk '{print $7}')
+              FGC_COUNT=$(echo $JSTAT_ROW | awk '{print $9}')
+
+              TOTAL_GCT=$(echo $JSTAT_ROW | awk '{print $13}')
+
+              JCMD_THREADS=$(jcmd $PID Thread.print 2>/dev/null)
+              THREAD_RUNNABLE=$(echo "$JCMD_THREADS" | awk '/java.lang.Thread.State: RUNNABLE/ {c++} END {print c+0}')
+              THREAD_BLOCKED=$(echo "$JCMD_THREADS" | awk '/java.lang.Thread.State: BLOCKED/ {c++} END {print c+0}')
+              THREAD_WAITING=$(echo "$JCMD_THREADS" | awk '/java.lang.Thread.State: WAITING/ && !/TIMED_WAITING/ {c++} END {print c+0}')
+              THREAD_TIMED_WAITING=$(echo "$JCMD_THREADS" | awk '/java.lang.Thread.State: TIMED_WAITING/ {c++} END {print c+0}')
+
+              echo "$TIMESTAMP,$PROCESS_NAME,$PID,$CPU,$MEM_MB,$THREADS,$THREAD_RUNNABLE,$THREAD_BLOCKED,$THREAD_WAITING,$THREAD_TIMED_WAITING,$EDEN_PCT,$OLD_PCT,$META_PCT,$YGC_COUNT,$FGC_COUNT,$TOTAL_GCT" >> $OUTPUT_FILE
+
+              sleep $INTERVAL
+          done
+          EOF
+
+          chmod +x jvm_advanced_tracker.sh
+
+      - name: Download ARM64 async-profiler
+        run: |
+          set -euxo pipefail
+
+          wget -q https://github.com/async-profiler/async-profiler/releases/download/v4.4/async-profiler-4.4-linux-arm64.tar.gz
+
+          mkdir async-profiler
+
+          tar -xzf async-profiler-4.4-linux-arm64.tar.gz \
+            -C async-profiler \
+            --strip-components=1
+
+          ./async-profiler/bin/asprof --version || true
+          file ./async-profiler/bin/asprof || true
+
+      - name: Run JVM profiling test
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TEST_MINUTES="${{ github.event.inputs.test_minutes }}"
+          TRACKER_INTERVAL="${{ github.event.inputs.tracker_interval_seconds }}"
+
+          if ! [[ "$TEST_MINUTES" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: test_minutes must be a number"
+            exit 1
+          fi
+
+          if ! [[ "$TRACKER_INTERVAL" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: tracker_interval_seconds must be a number"
+            exit 1
+          fi
+
+          if (( TEST_MINUTES < 1 || TEST_MINUTES > 120 )); then
+            echo "ERROR: test_minutes must be between 1 and 120"
+            exit 1
+          fi
+
+          if (( TRACKER_INTERVAL < 1 || TRACKER_INTERVAL > 300 )); then
+            echo "ERROR: tracker_interval_seconds must be between 1 and 300"
+            exit 1
+          fi
+
+          mkdir -p artifacts
+
+          echo "Trying to relax perf restrictions if allowed..."
+          sudo sysctl -w kernel.perf_event_paranoid=1 || true
+
+          echo "Starting Java application..."
+          java ProfilePoc > artifacts/app.log 2>&1 &
+          JVM_PID=$!
+
+          echo "$JVM_PID" > artifacts/jvm.pid
+          echo "JVM PID: $JVM_PID"
+
+          sleep 5
+
+          echo "Checking JVM process..."
+          ps -p "$JVM_PID" -f
+
+          echo "Starting CSV tracker..."
+          ./jvm_advanced_tracker.sh "$JVM_PID" "$TRACKER_INTERVAL" > artifacts/tracker.log 2>&1 &
+          TRACKER_PID=$!
+
+          echo "$TRACKER_PID" > artifacts/tracker.pid
+          echo "Tracker PID: $TRACKER_PID"
+
+          END_TIME=$((SECONDS + TEST_MINUTES * 60))
+
+          echo "Capturing CPU flame graph..."
+          if ! ./async-profiler/bin/asprof -d 15 -f artifacts/cpu_profile.html "$JVM_PID"; then
+            echo "Default CPU profiling failed. Retrying with itimer mode..." | tee -a artifacts/profiler_fallback.log
+            ./async-profiler/bin/asprof -e itimer -d 15 -f artifacts/cpu_profile.html "$JVM_PID"
+          fi
+
+          echo "Capturing heap allocation flame graph..."
+          ./async-profiler/bin/asprof -d 15 -e alloc -f artifacts/memory_profile.html "$JVM_PID"
+
+          REMAINING=$((END_TIME - SECONDS))
+
+          if (( REMAINING > 0 )); then
+            echo "Keeping JVM alive for $REMAINING more seconds for time-series CSV collection..."
+            sleep "$REMAINING"
+          fi
+
+          echo "Stopping tracker..."
+          kill "$TRACKER_PID" 2>/dev/null || true
+          wait "$TRACKER_PID" 2>/dev/null || true
+
+          echo "Stopping Java app..."
+          kill "$JVM_PID" 2>/dev/null || true
+          wait "$JVM_PID" 2>/dev/null || true
+
+          cp jvm_advanced_timeseries.csv artifacts/ 2>/dev/null || true
+
+          echo "Generated artifacts:"
+          ls -lah artifacts
+
+          echo "CSV preview:"
+          head -20 artifacts/jvm_advanced_timeseries.csv || true
+
+      - name: Upload result artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arm64-jvm-profiling-results
+          path: artifacts/
+          if-no-files-found: warn
